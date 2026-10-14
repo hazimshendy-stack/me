@@ -1,5 +1,3 @@
-import React from 'react';
-
 export type ToastKind = 'info' | 'success' | 'error';
 
 export interface ToastMsg {

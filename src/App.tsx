@@ -12,7 +12,7 @@ import { WeeklyDashboard } from './components/WeeklyDashboard';
 import { SettingsPanel } from './components/SettingsPanel';
 import { ToastView, type ToastMsg } from './components/Toast';
 import { PILLARS, type CalendarEvent, type Pillar } from './domain/types';
-import { addDays, startOfMonth, toISODate } from './utils/date';
+import { addDays, toISODate } from './utils/date';
 import { newId } from './domain/id';
 
 function Shell(): JSX.Element {
