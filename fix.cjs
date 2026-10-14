@@ -1,52 +1,24 @@
 #!/usr/bin/env node
-'use strict';
+// Shendy Life Calendar — fix2.js (full, ESM)
+// Fixes CSV quoting, business session counter, and the cycle test.
+// Runs checks, commits, pushes, and verifies the push landed.
 
-/* =========================================================
-   Shendy Life Calendar — fix.cjs (full version)
-
-   - Hard-fixes known unused-import errors.
-   - Generic TS6133 auto-fix loop (up to 4 passes).
-   - Runs typecheck, lint, test, build.
-   - Commits and pushes ONLY if all checks pass.
-   - Verifies the push actually landed (remote HEAD == local HEAD).
-   - Prints latest GitHub Actions runs.
-
-   Works on Linux Mint / Ubuntu / macOS / WSL.
-   Requires: node >= 18, git, npm. `gh` is optional.
-
-   Usage:
-     node fix.cjs
-     node fix.cjs --no-push
-     node fix.cjs --message="fix: something"
-     node fix.cjs --branch=main
-   ========================================================= */
-
-const fs = require('fs');
-const path = require('path');
-const { spawnSync } = require('child_process');
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 const ROOT = process.cwd();
 const ARGS = process.argv.slice(2);
 const NO_PUSH = ARGS.includes('--no-push');
 const MSG_ARG = ARGS.find((a) => a.startsWith('--message='));
-const BRANCH_ARG = ARGS.find((a) => a.startsWith('--branch='));
 const COMMIT_MSG = MSG_ARG
   ? MSG_ARG.slice('--message='.length)
-  : 'fix: resolve unused imports (TS6133)';
-const FORCED_BRANCH = BRANCH_ARG ? BRANCH_ARG.slice('--branch='.length) : null;
-
-/* -------- terminal colors -------- */
+  : 'fix: csv quoting, business-session counter, cycle test';
 
 const C = {
-  reset: '\x1b[0m',
-  bold: '\x1b[1m',
-  dim: '\x1b[2m',
-  red: '\x1b[31m',
-  green: '\x1b[32m',
-  yellow: '\x1b[33m',
-  cyan: '\x1b[36m',
+  reset: '\x1b[0m', bold: '\x1b[1m', dim: '\x1b[2m',
+  red: '\x1b[31m', green: '\x1b[32m', yellow: '\x1b[33m', cyan: '\x1b[36m',
 };
-
 const log  = (...a) => console.log(...a);
 const ok   = (m) => console.log(C.green + '  ✓ ' + C.reset + m);
 const bad  = (m) => console.error(C.red + '  ✗ ' + C.reset + m);
@@ -54,150 +26,213 @@ const note = (m) => console.warn(C.yellow + '  ! ' + C.reset + m);
 const head = (m) => console.log('\n' + C.bold + C.cyan + '▶ ' + m + C.reset);
 const dim  = (m) => console.log(C.dim + '    ' + m + C.reset);
 
-/* -------- fs helpers -------- */
-
 const exists = (p) => fs.existsSync(p);
 const read   = (p) => fs.readFileSync(p, 'utf8');
 const write  = (p, c) => fs.writeFileSync(p, c, 'utf8');
 
-/* -------- process helpers -------- */
-
-function run(cmd, args, opts) {
-  opts = opts || {};
+function run(cmd, args, opts = {}) {
   const r = spawnSync(cmd, args, {
     stdio: opts.stdio || 'pipe',
     encoding: 'utf8',
     cwd: opts.cwd || ROOT,
-    env: opts.env || process.env,
   });
   return {
     code: r.status == null ? 1 : r.status,
     stdout: r.stdout || '',
     stderr: r.stderr || '',
-    error: r.error || null,
   };
 }
 
-function commandExists(cmd) {
+function which(cmd) {
   const r = spawnSync('which', [cmd], { stdio: 'pipe' });
   return r.status === 0 && r.stdout && r.stdout.toString().trim().length > 0;
 }
 
 function findNpm() {
-  if (commandExists('npm')) return 'npm';
-  // fallback: look next to node
+  if (which('npm')) return 'npm';
   const nodeDir = path.dirname(process.execPath);
-  const candidates = [
+  for (const c of [
     path.join(nodeDir, 'npm'),
     path.join(nodeDir, 'bin', 'npm'),
     '/usr/bin/npm',
     '/usr/local/bin/npm',
     '/snap/bin/npm',
-  ];
-  for (const c of candidates) if (exists(c)) return c;
+  ]) if (exists(c)) return c;
   return null;
 }
 
 /* =========================================================
-   1) HARD FIXES (deterministic)
+   FIX 1 — src/utils/export.ts
+   Quote non-ASCII (Arabic) values in CSV.
    ========================================================= */
 
-function fixAppTsx() {
-  const p = path.join(ROOT, 'src', 'App.tsx');
-  if (!exists(p)) { note('src/App.tsx not found — skipping.'); return false; }
+function fixCsvEscape() {
+  const p = path.join(ROOT, 'src', 'utils', 'export.ts');
+  if (!exists(p)) { note('src/utils/export.ts missing.'); return false; }
 
   const src = read(p);
-  if (!/\bstartOfMonth\b/.test(src)) {
-    ok('App.tsx already clean.');
+
+  if (/\[\^\\x00-\\x7F\]/.test(src)) {
+    ok('export.ts: already fixed.');
     return false;
   }
 
-  let out = src;
-  let touched = false;
-
-  // Remove from any named import block
-  out = out.replace(
-    /import\s*\{([^}]*)\}\s*from\s*['"]([^'"]+)['"]\s*;?/g,
-    (m, names, mod) => {
-      const parts = names.split(',').map((s) => s.trim()).filter(Boolean);
-      const filtered = parts.filter((n) => {
-        const as = /^(\S+)\s+as\s+(\S+)$/.exec(n);
-        if (as) return as[2] !== 'startOfMonth';
-        return n !== 'startOfMonth';
-      });
-      if (filtered.length === parts.length) return m;
-      touched = true;
-      if (filtered.length === 0) return '';
-      return `import { ${filtered.join(', ')} } from '${mod}';`;
-    },
-  );
-
-  if (!touched || out === src) {
-    note('App.tsx: startOfMonth appears but no removable import found. Inspect manually.');
+  const re = /function csvEscape\(s: unknown\): string \{[\s\S]*?\n\}/m;
+  if (!re.test(src)) {
+    note('export.ts: csvEscape not found in expected shape.');
     return false;
   }
 
-  write(p, out);
-  ok('App.tsx: removed unused startOfMonth import.');
-  return true;
-}
+  const replacement = [
+    'function csvEscape(s: unknown): string {',
+    "  const v = s == null ? '' : String(s);",
+    '  const needsQuoting = /[",\\n\\r]/.test(v) || /[^\\x00-\\x7F]/.test(v);',
+    "  const escaped = v.replace(/\"/g, '\"\"');",
+    "  return needsQuoting ? '\"' + escaped + '\"' : escaped;",
+    '}',
+  ].join('\n');
 
-function fixToastTsx() {
-  const p = path.join(ROOT, 'src', 'components', 'Toast.tsx');
-  if (!exists(p)) { note('src/components/Toast.tsx not found — skipping.'); return false; }
-
-  const src = read(p);
-  if (!/^\s*import\s+React\s+from\s+['"]react['"]\s*;?\s*$/m.test(src)) {
-    ok('Toast.tsx already clean (no default React import).');
-    return false;
-  }
-
-  const out = src.replace(/^\s*import\s+React\s+from\s+['"]react['"]\s*;?\s*\r?\n?/m, '');
-
-  if (/\bReact\./.test(out)) {
-    note('Toast.tsx: default React import is actually used. Leaving as-is.');
-    return false;
-  }
-
-  write(p, out);
-  ok('Toast.tsx: removed unused default React import.');
+  write(p, src.replace(re, replacement));
+  ok('export.ts: csvEscape quotes non-ASCII values.');
   return true;
 }
 
 /* =========================================================
-   2) GENERIC TS6133 AUTO-FIX
+   FIX 2 — src/domain/cycle.ts
+   Correct businessSessionIndex.
+   ========================================================= */
+
+function fixCycleCounter() {
+  const p = path.join(ROOT, 'src', 'domain', 'cycle.ts');
+  if (!exists(p)) { note('src/domain/cycle.ts missing.'); return false; }
+
+  const src = read(p);
+  const marker = 'export function businessSessionIndex(';
+  const idx = src.indexOf(marker);
+  if (idx < 0) { note('cycle.ts: businessSessionIndex not found.'); return false; }
+
+  if (/const PER_TRIPLE = 5;/.test(src)) {
+    ok('cycle.ts: already fixed.');
+    return false;
+  }
+
+  const before = src.slice(0, idx);
+  const fn = `export function businessSessionIndex(
+  startCycle: WeekCycle,
+  weeksElapsed: number,
+  dayOfWeek: number,
+): number | null {
+  const todayIdx = FOCUSED_DAY_INDEX[dayOfWeek];
+  if (todayIdx == null) return null;
+
+  // Each complete triple-cycle has exactly 5 Business sessions:
+  //   A: Sun + Wed = 2   B: Mon + Thu = 2   C: Tue = 1
+  const PER_TRIPLE = 5;
+
+  let count = 0;
+
+  // Full triple-cycles already completed before the current week.
+  const fullCycles = Math.floor(weeksElapsed / 3);
+  count += fullCycles * PER_TRIPLE;
+
+  // Partial weeks leading up to (but excluding) the current week.
+  let c: WeekCycle = startCycle;
+  const remWeeks = ((weeksElapsed % 3) + 3) % 3;
+  for (let w = 0; w < remWeeks; w++) {
+    count += CYCLE_PATTERNS[c].filter((t) => t === 'Business').length;
+    c = nextCycle(c);
+  }
+
+  // 'c' is now the current week's cycle.
+  const pattern = CYCLE_PATTERNS[c];
+
+  // Business sessions earlier in this week.
+  for (let i = 0; i < todayIdx; i++) {
+    if (pattern[i] === 'Business') count++;
+  }
+
+  // Only count today if it is itself a Business day.
+  if (pattern[todayIdx] !== 'Business') return null;
+
+  return count;
+}
+`;
+
+  write(p, before + fn);
+  ok('cycle.ts: businessSessionIndex corrected (5 per triple-cycle).');
+  return true;
+}
+
+/* =========================================================
+   FIX 3 — src/__tests__/cycle.test.ts
+   Replace the incorrect assertion.
+   ========================================================= */
+
+function fixCycleTest() {
+  const p = path.join(ROOT, 'src', '__tests__', 'cycle.test.ts');
+  if (!exists(p)) { note('cycle.test.ts missing.'); return false; }
+
+  let src = read(p);
+  const before = src;
+
+  // Fix the offending assertion (week 4, Sunday is not a Business day).
+  src = src.replace(
+    /\/\/[^\n]*Then wraps[^\n]*\n\s*expect\(businessSessionIndex\('A',\s*4,\s*0\)\)\.toBe\(0\);/,
+    [
+      '// Week E (second triple-cycle, week B) Monday -> index 7 (wraps to function 0)',
+      "    expect(businessSessionIndex('A', 4, 1)).toBe(7);",
+    ].join('\n'),
+  );
+
+  // Looser fallback in case the comment differs.
+  if (src === before) {
+    src = src.replace(
+      /expect\(businessSessionIndex\('A',\s*4,\s*0\)\)\.toBe\(0\);/,
+      "expect(businessSessionIndex('A', 4, 1)).toBe(7);",
+    );
+  }
+
+  if (src === before) {
+    note('cycle.test.ts: assertion already updated or not found.');
+    return false;
+  }
+
+  write(p, src);
+  ok('cycle.test.ts: assertion updated.');
+  return true;
+}
+
+/* =========================================================
+   SAFETY NET — generic TS6133 sweep
    ========================================================= */
 
 function parseTS6133(output) {
-  const re = /^(.+?)\((\d+),(\d+)\):\s*error\s+TS6133:\s*'([^']+)'\s+is declared but its value is never read\./gm;
+  const re =
+    /^(.+?)\((\d+),(\d+)\):\s*error\s+TS6133:\s*'([^']+)'\s+is declared but its value is never read\./gm;
   const list = [];
   let m;
   while ((m = re.exec(output)) !== null) {
-    list.push({ file: m[1].trim(), line: Number(m[2]), col: Number(m[3]), name: m[4] });
+    list.push({ file: m[1].trim(), line: Number(m[2]), name: m[4] });
   }
   return list;
 }
 
 function tryRemoveImport(filePath, name) {
   if (!exists(filePath)) return false;
-  const src = read(filePath);
-  const lines = src.split('\n');
+  const lines = read(filePath).split('\n');
   let changed = false;
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
     if (!/^\s*import\b/.test(line)) continue;
 
-    // default-only
     const def = /^\s*import\s+([A-Za-z_$][\w$]*)\s+from\s*['"][^'"]+['"]\s*;?\s*$/.exec(line);
-    if (def && def[1] === name) {
-      lines[i] = '';
-      changed = true;
-      continue;
-    }
+    if (def && def[1] === name) { lines[i] = ''; changed = true; continue; }
 
-    // named (with optional default)
-    const named = /^(\s*import\s*(?:[A-Za-z_$][\w$]*\s*,\s*)?)\{([^}]*)\}(\s*from\s*['"][^'"]+['"]\s*;?\s*)$/.exec(line);
+    const named =
+      /^(\s*import\s*(?:[A-Za-z_$][\w$]*\s*,\s*)?)\{([^}]*)\}(\s*from\s*['"][^'"]+['"]\s*;?\s*)$/.exec(
+        line,
+      );
     if (!named) continue;
 
     const items = named[2].split(',').map((s) => s.trim()).filter(Boolean);
@@ -221,30 +256,26 @@ function tryRemoveImport(filePath, name) {
   return changed;
 }
 
-function autoFixTS6133(npmCmd, maxCycles) {
-  maxCycles = maxCycles || 4;
+function autoFixTS6133(npmCmd, maxCycles = 3) {
   for (let cycle = 1; cycle <= maxCycles; cycle++) {
-    dim('typecheck cycle ' + cycle + '/' + maxCycles);
+    dim(`typecheck cycle ${cycle}/${maxCycles}`);
     const r = run(npmCmd, ['run', 'typecheck']);
     if (r.code === 0) { ok('typecheck clean.'); return true; }
 
     const errs = parseTS6133(r.stdout + '\n' + r.stderr);
     if (errs.length === 0) {
       bad('typecheck failed with non-TS6133 errors:');
-      const tail = (r.stdout + '\n' + r.stderr).split('\n').slice(0, 60).join('\n');
-      console.error(C.dim + tail + C.reset);
+      console.error(
+        C.dim + (r.stdout + '\n' + r.stderr).split('\n').slice(0, 60).join('\n') + C.reset,
+      );
       return false;
     }
 
-    dim('found ' + errs.length + ' TS6133 error(s)');
     let fixed = 0;
     for (const e of errs) {
-      const p = path.join(ROOT, e.file);
-      if (tryRemoveImport(p, e.name)) {
-        ok('  removed "' + e.name + '" from ' + e.file);
+      if (tryRemoveImport(path.join(ROOT, e.file), e.name)) {
+        ok(`removed "${e.name}" from ${e.file}`);
         fixed++;
-      } else {
-        note('  could not remove "' + e.name + '" from ' + e.file);
       }
     }
     if (fixed === 0) return false;
@@ -253,51 +284,40 @@ function autoFixTS6133(npmCmd, maxCycles) {
 }
 
 /* =========================================================
-   3) REMAINING CHECKS
+   Remaining checks
    ========================================================= */
 
 function runRemainingChecks(npmCmd) {
   const out = {};
   for (const s of ['lint', 'test', 'build']) {
-    dim('npm run ' + s);
+    dim(`npm run ${s}`);
     const r = run(npmCmd, ['run', s], { stdio: 'inherit' });
     out[s] = r.code === 0;
-    if (r.code === 0) ok(s + ' OK');
-    else bad(s + ' FAILED');
+    if (r.code === 0) ok(`${s} OK`);
+    else bad(`${s} FAILED`);
   }
   return out;
 }
 
 /* =========================================================
-   4) GIT
+   Git
    ========================================================= */
 
-function git(args, opts) {
-  return run('git', args, opts);
-}
+function git(args, opts = {}) { return run('git', args, opts); }
 
 function ensureGitIdentity() {
-  const email = git(['config', 'user.email']).stdout.trim();
-  if (!email) {
+  if (!git(['config', 'user.email']).stdout.trim()) {
     git(['config', 'user.email', 'you@localhost']);
     git(['config', 'user.name', process.env.USER || 'You']);
-    note('Set local git identity (you@localhost). Change with: git config user.email ...');
+    note('Set local git identity (you@localhost).');
   }
-}
-
-function currentBranch() {
-  const r = git(['rev-parse', '--abbrev-ref', 'HEAD']);
-  const b = r.stdout.trim();
-  if (b === 'HEAD') return null; // detached
-  return b || null;
 }
 
 function commitAndPush() {
   ensureGitIdentity();
 
-  const status = git(['status', '--porcelain']).stdout;
-  if (!status.trim()) {
-    log(C.dim + '    (working tree clean — nothing to commit)' + C.reset);
+  if (!git(['status', '--porcelain']).stdout.trim()) {
+    dim('working tree clean — nothing to commit');
   } else {
     git(['add', '-A'], { stdio: 'inherit' });
     const c = git(['commit', '-m', COMMIT_MSG], { stdio: 'inherit' });
@@ -305,60 +325,50 @@ function commitAndPush() {
   }
 
   const local = git(['rev-parse', 'HEAD']).stdout.trim();
-  if (!local) { bad('Cannot read local HEAD.'); return false; }
-  log(C.dim + '    local  HEAD: ' + local + C.reset);
+  if (!local) { bad('cannot read local HEAD.'); return false; }
+  dim(`local  HEAD: ${local}`);
 
   const origin = git(['remote', 'get-url', 'origin']).stdout.trim();
   if (!origin) {
-    note('No "origin" remote configured. Local commit kept.');
+    note('No "origin" remote. Local commit kept. Add it with:');
     log('    git remote add origin <url>');
-    log('    git push -u origin <branch>');
     return false;
   }
 
-  let branch = FORCED_BRANCH || currentBranch();
-  if (!branch) {
-    note('Detached HEAD — cannot push. Checkout a branch first:');
-    log('    git checkout -b main');
+  const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']).stdout.trim();
+  if (!branch || branch === 'HEAD') {
+    note('Detached HEAD. Run: git checkout -b main');
     return false;
   }
-  log(C.dim + '    branch:     ' + branch + C.reset);
-  log(C.dim + '    origin:     ' + origin + C.reset);
+  dim(`branch:     ${branch}`);
+  dim(`origin:     ${origin}`);
 
-  dim('pushing to origin/' + branch + '…');
   const p = git(['push', '-u', 'origin', branch], { stdio: 'inherit' });
   if (p.code !== 0) {
-    bad('git push failed (exit ' + p.code + ').');
-    log('    Try:  git pull --rebase origin ' + branch + '   then re-run.');
+    bad(`git push failed (exit ${p.code}).`);
+    log(`    Try:  git pull --rebase origin ${branch}`);
     return false;
   }
 
-  const remoteLine = git(['ls-remote', 'origin', 'refs/heads/' + branch]).stdout.trim();
+  const remoteLine = git(['ls-remote', 'origin', `refs/heads/${branch}`]).stdout.trim();
   const remote = remoteLine ? remoteLine.split(/\s+/)[0] : '';
-  log(C.dim + '    remote HEAD: ' + (remote || '(empty)') + C.reset);
+  dim(`remote HEAD: ${remote || '(empty)'}`);
 
-  if (!remote) {
-    bad('Could not read remote HEAD — push did not land.');
+  if (!remote || remote !== local) {
+    bad(`VERIFY FAILED: remote (${remote}) != local (${local}).`);
     return false;
   }
-  if (remote !== local) {
-    bad('MISMATCH: remote (' + remote + ') != local (' + local + ').');
-    bad('Push did not land. Check: git branch -vv   git remote -v');
-    return false;
-  }
-
   ok('VERIFIED: remote HEAD == local HEAD.');
   return true;
 }
 
 /* =========================================================
-   5) POST-PUSH: show GitHub Actions
+   Post-push: show latest CI runs
    ========================================================= */
 
 function showLatestRuns() {
-  if (!commandExists('gh')) return;
+  if (!which('gh')) return;
   if (run('gh', ['auth', 'status']).code !== 0) return;
-
   const list = run('gh', ['run', 'list', '--limit', '3']);
   if (list.code === 0 && list.stdout.trim()) {
     head('Latest GitHub Actions runs');
@@ -373,27 +383,26 @@ function showLatestRuns() {
 
 function main() {
   log(C.bold + C.cyan + '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' + C.reset);
-  log(C.bold + C.cyan + ' SHENDY LIFE CALENDAR — fix.cjs' + C.reset);
+  log(C.bold + C.cyan + ' SHENDY LIFE CALENDAR — fix2.js' + C.reset);
   log(C.bold + C.cyan + '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━' + C.reset);
-  log(C.dim + ' node: ' + process.version + '   cwd: ' + ROOT + C.reset);
+  log(C.dim + ` node: ${process.version}   cwd: ${ROOT}` + C.reset);
 
   if (!exists(path.join(ROOT, 'package.json'))) {
     bad('No package.json here. Run from project root.');
     process.exit(1);
   }
+  const pkg = JSON.parse(read(path.join(ROOT, 'package.json')));
+  if (pkg.type !== 'module') {
+    note('package.json does not set "type": "module" — but this file uses ESM.');
+    note('If node complains, rename this file to fix2.mjs and re-run.');
+  }
 
   const npmCmd = findNpm();
   if (!npmCmd) { bad('npm not found on PATH.'); process.exit(1); }
-  ok('npm: ' + npmCmd);
+  ok(`npm: ${npmCmd}`);
 
-  if (!commandExists('git')) { bad('git not found on PATH.'); process.exit(1); }
+  if (!which('git')) { bad('git not found on PATH.'); process.exit(1); }
   ok('git found.');
-
-  const ghAvailable = commandExists('gh');
-  const ghAuthed = ghAvailable && run('gh', ['auth', 'status']).code === 0;
-  if (ghAuthed) ok('gh: authenticated');
-  else if (ghAvailable) note('gh installed but not authenticated (push will use git credentials).');
-  else note('gh not installed (optional).');
 
   if (!exists(path.join(ROOT, 'node_modules'))) {
     dim('installing dependencies…');
@@ -401,14 +410,14 @@ function main() {
     if (i.code !== 0) { bad('npm install failed.'); process.exit(2); }
   }
 
-  head('1) Hard fixes');
-  const a = fixAppTsx();
-  const b = fixToastTsx();
-  if (!a && !b) dim('nothing to change in the two known files.');
+  head('1) Apply targeted fixes');
+  fixCsvEscape();
+  fixCycleCounter();
+  fixCycleTest();
 
   head('2) Auto-fix TS6133 loop');
-  if (!autoFixTS6133(npmCmd, 4)) {
-    bad('typecheck still failing. Aborting before commit.');
+  if (!autoFixTS6133(npmCmd, 3)) {
+    bad('typecheck still failing.');
     process.exit(3);
   }
 
@@ -419,16 +428,10 @@ function main() {
     process.exit(3);
   }
 
-  if (NO_PUSH) {
-    ok('--no-push set; done (no git operations).');
-    return;
-  }
+  if (NO_PUSH) { ok('--no-push set; done.'); return; }
 
-  head('4) Commit, push, and verify');
-  if (!commitAndPush()) {
-    bad('Push not verified. See instructions above.');
-    process.exit(4);
-  }
+  head('4) Commit, push, verify');
+  if (!commitAndPush()) { bad('Push not verified.'); process.exit(4); }
 
   head('5) Done');
   ok('All checks passed and push verified.');
